@@ -23,12 +23,16 @@ namespace ELS
         Microsteps getMicrosteps() const;
         FocusDirection getDirection() const;
         FocusSpeed getSpeed() const;
+        bool isBacklashEnabled() const;
+        uint32_t getBacklashSteps() const;
 
         void enableMotor(bool isEnabled);
         void reverseMotor(bool isReversed);
         void setMicrosteps(Microsteps microsteps);
         void setDirection(FocusDirection direction);
         void setSpeed(FocusSpeed speed);
+        void enableBacklash(bool isEnabled);
+        void setBacklashSteps(uint32_t steps);
 
         void testMotor(int numCycles);
 
@@ -40,10 +44,16 @@ namespace ELS
             typedef void (*MoveDoneCallback)(void *arg, bool isAbort);
 
             MoveInfo(uint32_t stepCount,
+                     uint32_t backlashSteps,
+                     FocusDirection direction,
+                     int usPerStep,
                      MoveDoneCallback callback,
                      void *data);
 
             uint32_t stepCount;
+            uint32_t backlashSteps;
+            FocusDirection direction;
+            int usPerStep;
             MoveDoneCallback callback;
             void *data;
             uint32_t stepsTaken;
@@ -89,6 +99,10 @@ namespace ELS
                          int usPerStep,
                          MoveInfo::MoveDoneCallback callback,
                          void *data);
+        void unwindBacklash(uint32_t backlashSteps,
+                            int usPerStep,
+                            MoveInfo::MoveDoneCallback callback,
+                            void *data);
         void abortMove();
         void moveNext();
 
@@ -120,6 +134,10 @@ namespace ELS
             virtual void getMaxPos() override;
             virtual void setSpeed(FocusSpeed speed) override;
             virtual void getSpeed() override;
+            virtual void enableBacklash(bool isEnabled) override;
+            virtual void getBacklashEnabled() override;
+            virtual void setBacklashSteps(uint32_t steps) override;
+            virtual void getBacklashSteps() override;
 
         private:
             void startRelativeFocus(FocusDirection dir,
@@ -159,6 +177,8 @@ namespace ELS
         FocusSpeed _speed;
         uint32_t _position;
         uint32_t _maxPosition;
+        bool _backlashEnabled;
+        uint32_t _backlashSteps;
 
         uint32_t _stepsPerRev;
         int _usPerStepSlow;

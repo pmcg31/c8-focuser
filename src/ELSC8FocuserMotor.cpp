@@ -43,6 +43,8 @@ namespace ELS
           _speed(FS_NORMAL),
           _position(0),
           _maxPosition(0),
+          _backlashEnabled(true),
+          _backlashSteps(650),
           _stepsPerRev(0),
           _usPerStepSlow(0),
           _usPerStepFast(0),
@@ -152,6 +154,16 @@ namespace ELS
         return _speed;
     }
 
+    bool C8FocuserMotor::isBacklashEnabled() const
+    {
+        return _backlashEnabled;
+    }
+
+    uint32_t C8FocuserMotor::getBacklashSteps() const
+    {
+        return _backlashSteps;
+    }
+
     void C8FocuserMotor::enableMotor(bool isEnabled)
     {
         if (isEnabled != _isEnabled)
@@ -229,6 +241,36 @@ namespace ELS
         }
     }
 
+    void C8FocuserMotor::enableBacklash(bool isEnabled)
+    {
+        if (_backlashEnabled != isEnabled)
+        {
+            _backlashEnabled = isEnabled;
+
+            if (_comms != 0)
+            {
+                _comms->backlashEnabled(_backlashEnabled);
+            }
+
+            updateConfigFromFields();
+        }
+    }
+
+    void C8FocuserMotor::setBacklashSteps(uint32_t steps)
+    {
+        if (_backlashSteps != steps)
+        {
+            _backlashSteps = steps;
+
+            if (_comms != 0)
+            {
+                _comms->backlashSteps(_backlashSteps);
+            }
+
+            updateConfigFromFields();
+        }
+    }
+
     void C8FocuserMotor::testMotor(int numCycles)
     {
         if (_isEnabled)
@@ -287,12 +329,16 @@ namespace ELS
                 JsonVariant docDirection = doc["direction"];
                 JsonVariant docMicrosteps = doc["microsteps"];
                 JsonVariant docReversed = doc["reversed"];
+                JsonVariant docBacklashEnabled = doc["backlashEnabled"];
+                JsonVariant docBacklashSteps = doc["backlashSteps"];
 
                 if ((docPosition.isUndefined() || docPosition.isNull()) ||
                     (docSpeed.isUndefined() || docSpeed.isNull()) ||
                     (docDirection.isUndefined() || docDirection.isNull()) ||
                     (docMicrosteps.isUndefined() || docMicrosteps.isNull()) ||
-                    (docReversed.isUndefined() || docReversed.isNull()))
+                    (docReversed.isUndefined() || docReversed.isNull()) ||
+                    (docBacklashEnabled.isUndefined() || docBacklashEnabled.isNull()) ||
+                    (docBacklashSteps.isUndefined() || docBacklashSteps.isNull()))
                 {
                     Serial2.println("At least one field is missing or empty in config");
                     return false;
@@ -302,13 +348,17 @@ namespace ELS
                 int tmpDirectionIdx = docDirection.as<int>();
                 int tmpMicrostepsIdx = docMicrosteps.as<int>();
                 bool tmpReversed = docReversed.as<bool>();
+                bool tmpBacklashEnabled = docBacklashEnabled.as<bool>();
+                uint32_t tmpBacklashSteps = docBacklashSteps.as<unsigned int>();
 
-                Serial2.printf("pos: %u speed: %d dir: %d micro: %d rev: %s\r\n",
+                Serial2.printf("pos: %u speed: %d dir: %d micro: %d rev: %s backlash: %s backlashSteps: %u\r\n",
                                tmpPosition,
                                tmpSpeedIdx,
                                tmpDirectionIdx,
                                tmpMicrostepsIdx,
-                               tmpReversed ? "true" : "false");
+                               tmpReversed ? "true" : "false",
+                               tmpBacklashEnabled ? "true" : "false",
+                               tmpBacklashSteps);
 
                 if (tmpMicrostepsIdx != (int)_microsteps)
                 {
@@ -331,6 +381,9 @@ namespace ELS
 
                 _position = tmpPosition;
                 _isReversed = tmpReversed;
+
+                _backlashEnabled = tmpBacklashEnabled;
+                _backlashSteps = tmpBacklashSteps;
             }
         }
 
@@ -353,6 +406,8 @@ namespace ELS
             doc["direction"] = (int)_direction;
             doc["microsteps"] = (int)_microsteps;
             doc["reversed"] = _isReversed;
+            doc["backlashEnabled"] = _backlashEnabled;
+            doc["backlashSteps"] = _backlashSteps;
 
             serializeJson(doc, configFile);
         }
@@ -411,8 +466,21 @@ namespace ELS
                                      MoveInfo::MoveDoneCallback callback,
                                      void *data)
     {
+        uint32_t backlashSteps = 0;
+        if (_direction == FD_FOCUS_OUTWARD)
+        {
+            if (_backlashEnabled)
+            {
+                backlashSteps = _backlashSteps;
+            }
+        }
 
-        _moveInfo = new MoveInfo(stepCount, callback, data);
+        _moveInfo = new MoveInfo(stepCount + backlashSteps,
+                                 backlashSteps,
+                                 _direction,
+                                 usPerStep,
+                                 callback,
+                                 data);
 
         esp_timer_start_periodic(_moveTimer, usPerStep);
 
@@ -420,6 +488,22 @@ namespace ELS
         {
             _comms->movingRel(_direction, stepCount);
         }
+    }
+
+    void C8FocuserMotor::unwindBacklash(uint32_t backlashSteps,
+                                        int usPerStep,
+                                        MoveInfo::MoveDoneCallback callback,
+                                        void *data)
+    {
+        setDirection(FD_FOCUS_INWARD);
+        _moveInfo = new MoveInfo(backlashSteps,
+                                 backlashSteps,
+                                 FD_FOCUS_INWARD,
+                                 usPerStep,
+                                 callback,
+                                 data);
+
+        esp_timer_start_periodic(_moveTimer, usPerStep);
     }
 
     void C8FocuserMotor::abortMove()
@@ -440,28 +524,48 @@ namespace ELS
 
         if (_moveInfo->isAbort)
         {
-            esp_timer_stop(_moveTimer);
-            if (_comms != 0)
+            // Only abort if we're not unwinding backlash
+            if (_moveInfo->backlashSteps != _moveInfo->stepCount)
             {
-                _comms->stopped(_position);
-            }
-            MoveInfo::MoveDoneCallback callback = _moveInfo->callback;
-            void *data = _moveInfo->data;
-            delete _moveInfo;
-            _moveInfo = 0;
-            (*callback)(data, true);
+                esp_timer_stop(_moveTimer);
+                MoveInfo::MoveDoneCallback callback = _moveInfo->callback;
+                void *data = _moveInfo->data;
+                uint32_t backlashSteps = _moveInfo->backlashSteps;
+                int usPerStep = _moveInfo->usPerStep;
+                delete _moveInfo;
+                _moveInfo = 0;
+                updateConfigFromFields();
 
-            return;
+                if (backlashSteps != 0)
+                {
+                    // Unwind backlash
+                    unwindBacklash(backlashSteps, usPerStep, callback, data);
+                }
+                else
+                {
+                    if (_comms != 0)
+                    {
+                        _comms->stopped(_position);
+                    }
+
+                    (*callback)(data, true);
+                }
+
+                return;
+            }
         }
 
         if (_direction == FD_FOCUS_INWARD)
         {
-            if (_position < _maxPosition)
+            if (_position > 0)
             {
                 step();
                 _moveInfo->stepsTaken++;
 
-                _position++;
+                if (_moveInfo->stepsTaken <= (_moveInfo->stepCount - _moveInfo->backlashSteps))
+                {
+                    _position--;
+                }
             }
             else
             {
@@ -470,12 +574,15 @@ namespace ELS
         }
         else
         {
-            if (_position > 0)
+            if (_position < _maxPosition)
             {
                 step();
                 _moveInfo->stepsTaken++;
 
-                _position--;
+                if (_moveInfo->stepsTaken <= (_moveInfo->stepCount - _moveInfo->backlashSteps))
+                {
+                    _position++;
+                }
             }
             else
             {
@@ -485,33 +592,70 @@ namespace ELS
 
         if (_moveInfo->isAbort)
         {
-            esp_timer_stop(_moveTimer);
-            if (_comms != 0)
+            // Only abort if we're not unwinding backlash
+            if (_moveInfo->backlashSteps != _moveInfo->stepCount)
             {
-                _comms->stopped(_position);
+                esp_timer_stop(_moveTimer);
+                MoveInfo::MoveDoneCallback callback = _moveInfo->callback;
+                void *data = _moveInfo->data;
+                uint32_t backlashSteps = _moveInfo->backlashSteps;
+                int usPerStep = _moveInfo->usPerStep;
+                delete _moveInfo;
+                _moveInfo = 0;
+                updateConfigFromFields();
+
+                if (backlashSteps != 0)
+                {
+                    // Unwind backlash
+                    unwindBacklash(backlashSteps, usPerStep, callback, data);
+                }
+                else
+                {
+                    if (_comms != 0)
+                    {
+                        _comms->stopped(_position);
+                    }
+
+                    (*callback)(data, true);
+                }
+
+                return;
             }
-            MoveInfo::MoveDoneCallback callback = _moveInfo->callback;
-            void *data = _moveInfo->data;
-            delete _moveInfo;
-            _moveInfo = 0;
-            (*callback)(data, true);
-            updateConfigFromFields();
-            return;
         }
 
         if (_moveInfo->stepsTaken == _moveInfo->stepCount)
         {
             esp_timer_stop(_moveTimer);
-            if (_comms != 0)
-            {
-                _comms->stopped(_position);
-            }
             MoveInfo::MoveDoneCallback callback = _moveInfo->callback;
             void *data = _moveInfo->data;
+            int usPerStep = _moveInfo->usPerStep;
+            uint32_t backlashSteps = _moveInfo->backlashSteps;
+
+            // Pretend there were no backlash steps if we're
+            // unwinding backlash
+            if (_moveInfo->backlashSteps == _moveInfo->stepCount)
+            {
+                backlashSteps = 0;
+            }
+
             delete _moveInfo;
             _moveInfo = 0;
-            (*callback)(data, false);
             updateConfigFromFields();
+
+            if (backlashSteps != 0)
+            {
+                // Unwind backlash
+                unwindBacklash(backlashSteps, usPerStep, callback, data);
+            }
+            else
+            {
+                if (_comms != 0)
+                {
+                    _comms->stopped(_position);
+                }
+
+                (*callback)(data, false);
+            }
         }
     }
 
@@ -637,9 +781,15 @@ namespace ELS
     //
 
     C8FocuserMotor::MoveInfo::MoveInfo(uint32_t stepCount,
+                                       uint32_t backlashSteps,
+                                       FocusDirection direction,
+                                       int usPerStep,
                                        MoveDoneCallback callback,
                                        void *data)
         : stepCount(stepCount),
+          backlashSteps(backlashSteps),
+          direction(direction),
+          usPerStep(usPerStep),
           callback(callback),
           data(data),
           stepsTaken(0),
@@ -739,11 +889,11 @@ namespace ELS
     void C8FocuserMotor::CommsListener::focusAbs(uint32_t position)
     {
         uint32_t steps = 0;
-        FocusDirection dir = FD_FOCUS_INWARD;
+        FocusDirection dir = FD_FOCUS_OUTWARD;
         if (position < _parent->_position)
         {
             steps = _parent->_position - position;
-            dir = FD_FOCUS_OUTWARD;
+            dir = FD_FOCUS_INWARD;
         }
         else
         {
@@ -840,6 +990,32 @@ namespace ELS
         if (_parent->_comms != 0)
         {
             _parent->_comms->speed(_parent->_speed);
+        }
+    }
+
+    void C8FocuserMotor::CommsListener::enableBacklash(bool isEnabled)
+    {
+        _parent->enableBacklash(isEnabled);
+    }
+
+    void C8FocuserMotor::CommsListener::getBacklashEnabled()
+    {
+        if (_parent->_comms != 0)
+        {
+            _parent->_comms->backlashEnabled(_parent->isBacklashEnabled());
+        }
+    }
+
+    void C8FocuserMotor::CommsListener::setBacklashSteps(uint32_t steps)
+    {
+        _parent->setBacklashSteps(steps);
+    }
+
+    void C8FocuserMotor::CommsListener::getBacklashSteps()
+    {
+        if (_parent->_comms != 0)
+        {
+            _parent->_comms->backlashSteps(_parent->getBacklashSteps());
         }
     }
 
